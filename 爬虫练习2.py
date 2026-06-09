@@ -163,3 +163,6 @@ if __name__ == "__main__":
     # 你可以改这里的起始页和结束页
     crawl_all_pages(start_page=2, end_page=3)  # 比如爬1-5页
     save_to_excel()
+
+
+

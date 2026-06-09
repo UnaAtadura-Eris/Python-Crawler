@@ -1,5 +1,5 @@
-# pip install requests pandas
 import csv
+import hashlib
 import html
 import logging
 import random
@@ -9,9 +9,17 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-
+import os
 import pandas as pd
 import requests
+
+from dotenv import load_dotenv
+
+# 解决中文乱码
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 
 # =========================
@@ -19,9 +27,17 @@ import requests
 # =========================
 
 SEARCH_KEYWORDS = [
-    "安卓",
-    "Windows",
-    "AI",
+    "Twitter",
+    "TikTok",
+    "Netflix",
+    "Steam",
+    "codex",
+    "Instagram",
+    "Gemini",
+    "GitHub",
+    "Linux",
+    "Docker",
+    "YouTube",
 ]
 
 COMMENT_PATTERNS = [
@@ -32,19 +48,26 @@ COMMENT_PATTERNS = [
     r"VPN",
     r"机场",
     r"节点",
+    # r"怎么.*(访问|打开|登录)",
+    # r"如何.*(注册|使用)",
+    # r"国内.*(能用|可以用)",
+    # r"(打不开|进不去)",
+    # r"(访问不了|连不上)",
+    # r"(求教|请教|求助)",
+    # r".*",
 ]
 
 # 仅保留最近 N 天内的评论
-DAYS_LIMIT = 7
+DAYS_LIMIT = 3
 
 # 搜索结果最大页数
-SEARCH_MAX_PAGES = 3
+SEARCH_MAX_PAGES = 5
 
 # 每个视频主评论最大采集页数
-COMMENT_MAX_PAGES = 5
+COMMENT_MAX_PAGES = 10
 
 # 每条主评论楼中楼最大采集页数
-SUB_REPLY_MAX_PAGES = 3
+SUB_REPLY_MAX_PAGES = 1
 
 # 评论每页数量，B站接口常见最大值为 20
 COMMENT_PAGE_SIZE = 20
@@ -60,8 +83,8 @@ REQUEST_TIMEOUT = 10
 MAX_RETRIES = 3
 
 # 请求间隔，避免过快
-REQUEST_SLEEP_MIN = 0.5
-REQUEST_SLEEP_MAX = 1.5
+REQUEST_SLEEP_MIN = 1.0
+REQUEST_SLEEP_MAX = 2.5
 
 # 输出文件
 OUTPUT_CSV = "bilibili_comments_result.csv"
@@ -69,9 +92,97 @@ OUTPUT_CSV = "bilibili_comments_result.csv"
 # 日志文件
 LOG_FILE = "bilibili_crawler.log"
 
-# 可选：如果遇到风控，可填入浏览器中的 Cookie
-# 示例：COOKIE = "SESSDATA=xxx; bili_jct=xxx;"
-COOKIE = ""
+# 填入浏览器中的 Cookie（建议填写，否则搜索接口容易返回空）
+# 打开 B站 -> F12 -> Network -> 任意请求 -> Headers -> Cookie
+# 至少需要包含 SESSDATA
+load_dotenv()
+COOKIE = os.environ.get("BILIBILI_COOKIE", "")
+
+# =========================
+# 签名相关
+# =========================
+
+# B站 wbi 签名所需的 mixin key（会定期失效，失效后需要更新）
+# 如果出现 -352 错误，说明此 key 已过期，需要重新抓取
+# 抓取方式：https://api.bilibili.com/x/web-interface/nav 返回的 wbi_img 字段
+_MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+]
+
+_wbi_keys_cache: Dict = {}
+_wbi_keys_lock = threading.Lock()
+
+
+def _get_wbi_keys(session: requests.Session) -> Tuple[str, str]:
+    """从 B站接口动态获取 img_key 和 sub_key，带缓存（每小时刷新）。"""
+    with _wbi_keys_lock:
+        now = time.time()
+        if _wbi_keys_cache.get("expire", 0) > now:
+            return _wbi_keys_cache["img_key"], _wbi_keys_cache["sub_key"]
+
+        try:
+            resp = session.get(
+                "https://api.bilibili.com/x/web-interface/nav",
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            nav = resp.json()
+
+            wbi_img = nav["data"]["wbi_img"]
+            img_url: str = wbi_img["img_url"]
+            sub_url: str = wbi_img["sub_url"]
+
+            img_key = img_url.rsplit("/", 1)[-1].split(".")[0]
+            sub_key = sub_url.rsplit("/", 1)[-1].split(".")[0]
+
+            raw = img_key + sub_key
+            mixin_key = "".join(raw[i] for i in _MIXIN_KEY_ENC_TAB)[:32]
+
+            _wbi_keys_cache["img_key"] = img_key
+            _wbi_keys_cache["sub_key"] = sub_key
+            _wbi_keys_cache["mixin_key"] = mixin_key
+            _wbi_keys_cache["expire"] = now + 3600
+
+            logging.info("WBI keys 刷新成功 img_key=%s", img_key)
+            print(f"[签名] WBI keys 刷新成功")
+
+        except Exception as exc:
+            logging.warning("获取 WBI keys 失败，将跳过签名: %s", exc)
+            print(f"[签名] 获取 WBI keys 失败: {exc}，请求将不带签名")
+            _wbi_keys_cache["img_key"] = ""
+            _wbi_keys_cache["sub_key"] = ""
+            _wbi_keys_cache["mixin_key"] = ""
+            _wbi_keys_cache["expire"] = now + 300  # 失败后 5 分钟再重试
+
+        return _wbi_keys_cache["img_key"], _wbi_keys_cache["sub_key"]
+
+
+def _add_wbi_sign(params: dict, session: requests.Session) -> dict:
+    """为请求参数添加 wts / w_rid 签名。"""
+    _get_wbi_keys(session)  # 确保 keys 已加载
+    mixin_key = _wbi_keys_cache.get("mixin_key", "")
+    if not mixin_key:
+        return params  # 获取失败时跳过签名
+
+    params = dict(params)
+    params["wts"] = int(time.time())
+
+    # 过滤特殊字符
+    chr_filter = re.compile(r"[!'()*]")
+    query_parts = []
+    for k in sorted(params.keys()):
+        v = chr_filter.sub("", str(params[k]))
+        query_parts.append(f"{k}={v}")
+
+    query_str = "&".join(query_parts)
+    w_rid = hashlib.md5((query_str + mixin_key).encode()).hexdigest()
+    params["w_rid"] = w_rid
+
+    return params
+
 
 # =========================
 # 日志配置
@@ -100,47 +211,60 @@ def get_session() -> requests.Session:
             "Referer": "https://www.bilibili.com/",
             "Origin": "https://www.bilibili.com",
         }
-        if COOKIE:
-            headers["Cookie"] = COOKIE
+        if COOKIE and COOKIE.strip():
+            headers["Cookie"] = COOKIE.strip()
         session.headers.update(headers)
         thread_local.session = session
     return thread_local.session
 
 
-def request_json(url: str, params: Optional[dict] = None) -> Optional[dict]:
-    """带重试的 JSON 请求。"""
+def request_json(
+    url: str,
+    params: Optional[dict] = None,
+    sign: bool = False,
+) -> Optional[dict]:
+    """带重试、签名的 JSON 请求。"""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             time.sleep(random.uniform(REQUEST_SLEEP_MIN, REQUEST_SLEEP_MAX))
 
             session = get_session()
-            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            _params = dict(params) if params else {}
+
+            if sign:
+                _params = _add_wbi_sign(_params, session)
+
+            response = session.get(url, params=_params, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
 
             data = response.json()
-            if data.get("code") != 0:
+            code = data.get("code")
+
+            if code != 0:
+                msg = data.get("message", "")
                 logging.warning(
                     "接口返回异常 code=%s message=%s url=%s params=%s",
-                    data.get("code"),
-                    data.get("message"),
-                    url,
-                    params,
+                    code, msg, url, _params,
                 )
+                print(f"[接口异常] code={code} msg={msg} url={url}")
+
+                # -352 是签名失败，-101 是未登录，这两种情况重试无意义
+                if code in (-352, -101, -403):
+                    return None
+
                 return None
 
             return data
 
         except Exception as exc:
             logging.warning(
-                "请求失败 attempt=%s/%s url=%s params=%s error=%s",
-                attempt,
-                MAX_RETRIES,
-                url,
-                params,
-                exc,
+                "请求失败 attempt=%s/%s url=%s error=%s",
+                attempt, MAX_RETRIES, url, exc,
             )
+            print(f"[请求失败] 第{attempt}/{MAX_RETRIES}次 {url} {exc}")
+
             if attempt == MAX_RETRIES:
-                logging.error("请求最终失败 url=%s params=%s", url, params)
+                logging.error("请求最终失败 url=%s", url)
                 return None
 
             time.sleep(1.5 * attempt)
@@ -152,7 +276,6 @@ def clean_text(text: str) -> str:
     """清洗 HTML 标签与空白字符。"""
     if not text:
         return ""
-
     text = html.unescape(text)
     text = re.sub(r"<.*?>", "", text)
     text = re.sub(r"\s+", " ", text)
@@ -165,7 +288,7 @@ def timestamp_to_str(ts: int) -> str:
 
 
 def search_videos() -> List[Dict]:
-    """搜索 Bilibili 视频，支持关键词和分页。"""
+    """搜索 Bilibili 视频，支持关键词和分页，带 WBI 签名。"""
     videos = []
     seen_bvid = set()
 
@@ -181,11 +304,20 @@ def search_videos() -> List[Dict]:
                 "page": page,
             }
 
-            data = request_json(search_url, params=params)
+            # 搜索接口需要 WBI 签名
+            data = request_json(search_url, params=params, sign=True)
+
             if not data:
+                print(f"[搜索] 关键词「{keyword}」第{page}页请求失败，跳过")
                 continue
 
-            results = data.get("data", {}).get("result", []) or []
+            result_data = data.get("data", {}) or {}
+            results = result_data.get("result", []) or []
+
+            print(f"[搜索] 关键词「{keyword}」第{page}页，返回 {len(results)} 个视频")
+
+            if not results:
+                print(f"[搜索] 没有结果，可能需要检查 Cookie 或签名")
 
             for item in results:
                 bvid = item.get("bvid")
@@ -228,8 +360,8 @@ def parse_reply_item(reply: Dict, video: Dict) -> Optional[Dict]:
         return None
 
     content = clean_text(reply.get("content", {}).get("message", ""))
-    matched, matched_pattern = match_comment(content)
 
+    matched, matched_pattern = match_comment(content)
     if not matched:
         return None
 
@@ -262,7 +394,7 @@ def get_sub_replies(video: Dict, root_rpid: int) -> List[Dict]:
             "ps": SUB_REPLY_PAGE_SIZE,
         }
 
-        data = request_json(sub_reply_url, params=params)
+        data = request_json(sub_reply_url, params=params, sign=True)
         if not data:
             break
 
@@ -296,11 +428,15 @@ def get_comments(video: Dict) -> List[Dict]:
             "sort": 2,
         }
 
-        data = request_json(reply_url, params=params)
+        data = request_json(reply_url, params=params, sign=True)
         if not data:
             break
 
-        replies = data.get("data", {}).get("replies", []) or []
+        reply_data = data.get("data", {}) or {}
+        replies = reply_data.get("replies", []) or []
+
+        print(f"[评论] {video['bvid']} 第{page}页，获取到 {len(replies)} 条主评论")
+
         if not replies:
             break
 
@@ -358,9 +494,14 @@ def main() -> None:
     print("[开始] Bilibili 视频评论采集")
     print(f"[配置] 最近 {DAYS_LIMIT} 天，搜索页数 {SEARCH_MAX_PAGES}，评论页数 {COMMENT_MAX_PAGES}")
 
+    if not COOKIE or not COOKIE.strip():
+        print("[警告] 未填写 Cookie，搜索接口可能返回空结果，建议填写 SESSDATA")
+
     videos = search_videos()
     if not videos:
-        print("[结束] 未搜索到视频")
+        print("[结束] 未搜索到视频，请检查：")
+        print("  1. Cookie 是否填写（尤其是 SESSDATA）")
+        print("  2. 查看日志文件了解接口返回的 code")
         return
 
     all_rows = []
@@ -387,7 +528,6 @@ def main() -> None:
                 print(f"[错误] {video['bvid']} 采集失败，详情见日志")
 
     save_csv(all_rows)
-
     print("[结束] 采集完成")
 
 
