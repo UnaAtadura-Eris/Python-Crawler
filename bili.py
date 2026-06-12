@@ -35,36 +35,42 @@ SEARCH_KEYWORDS = [
     "Instagram",
     "Gemini",
     "GitHub",
-    "Linux",
     "Docker",
     "YouTube",
+    "Telegram",
+    "WhatsApp",
+    "Facebook",
+    "Reddit",
+    "Snapchat",
+    "科学上网",
+    "Spotify",
+    "Discord",
+    "Epic Games",
+    "留学",
+    "海外",
+    "翻墙",
 ]
 
 COMMENT_PATTERNS = [
-    r"翻.?墙",
-    r"科.?学.?上.?网",
-    r"魔.?法",
-    r"梯.?子",
-    r"VPN",
-    r"机场",
-    r"节点",
-    # r"怎么.*(访问|打开|登录)",
-    # r"如何.*(注册|使用)",
-    # r"国内.*(能用|可以用)",
-    # r"(打不开|进不去)",
-    # r"(访问不了|连不上)",
-    # r"(求教|请教|求助)",
-    # r".*",
+    # r"翻.?墙",
+    # r"科.?学.?上.?网",
+    # r"魔.?法",
+    # r"梯.?子",
+    # r"VPN",
+    # r"机场",
+    # r"节点",
+    r".*?(有偿|付费|报酬|给钱|给米).*?",
+    r".*?(怎么|如何|求|推荐|教|带).*?(上网|翻墙|科学上网|魔法|梯子|VPN|机场|节点).*?",
 ]
 
 # 仅保留最近 N 天内的评论
 DAYS_LIMIT = 3
 
 # 搜索结果最大页数
-SEARCH_MAX_PAGES = 5
+SEARCH_MAX_PAGES = 20
 
 # 每个视频主评论最大采集页数
-COMMENT_MAX_PAGES = 10
+COMMENT_MAX_PAGES = 5
 
 # 每条主评论楼中楼最大采集页数
 SUB_REPLY_MAX_PAGES = 1
@@ -80,7 +86,7 @@ MAX_WORKERS = 5
 REQUEST_TIMEOUT = 10
 
 # 请求失败重试次数
-MAX_RETRIES = 3
+MAX_RETRIES = 1
 
 # 请求间隔，避免过快
 REQUEST_SLEEP_MIN = 1.0
@@ -478,7 +484,7 @@ def save_csv(rows: List[Dict], output_file: str = OUTPUT_CSV) -> None:
 
     df = df[columns]
     df = df.drop_duplicates(subset=["comment_id"], keep="first")
-
+    
     df.to_csv(
         output_file,
         index=False,
